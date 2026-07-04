@@ -5,6 +5,22 @@ struct Exercise: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
     var targetReps: Int
+    var block: Int = 0            // rotation group; blocks cycle one per interval
+
+    enum CodingKeys: String, CodingKey { case id, name, targetReps, block }
+    init(id: UUID = UUID(), name: String, targetReps: Int, block: Int = 0) {
+        self.id = id; self.name = name; self.targetReps = targetReps; self.block = block
+    }
+    // Custom decode: synthesized Codable throws keyNotFound (not the default) for
+    // a missing key, so old state.json without `block` would fail to load and wipe
+    // the user's exercises + lifetime stats. decodeIfPresent keeps them.
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decode(String.self, forKey: .name)
+        targetReps = try c.decode(Int.self, forKey: .targetReps)
+        block = try c.decodeIfPresent(Int.self, forKey: .block) ?? 0
+    }
 }
 
 /// One row of the due checklist — a snapshot of an exercise at fire time.
@@ -52,10 +68,12 @@ final class AppModel: ObservableObject {
     // "Pushups" keeps its history; a rename starts a fresh stat line.
     @Published var sessionReps: [String: Int] = [:]
     @Published var sessionRounds = 0
+    @Published var currentBlock = 0   // in-memory only; resets to first block on launch
     @Published var lifetimeReps: [String: Int] { didSet { persist() } }
     @Published var lifetimeRounds: Int { didSet { persist() } }
 
     private let storeURL: URL
+    private let backupURL: URL
     private var timer: Timer?
     private var activity: NSObjectProtocol?
     private var authRequested = false
@@ -73,9 +91,14 @@ final class AppModel: ObservableObject {
                 .appendingPathComponent("WorkoutInterval", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         storeURL = dir.appendingPathComponent("state.json")
+        backupURL = dir.appendingPathComponent("state.backup.json")
 
-        let saved = (try? Data(contentsOf: storeURL))
-            .flatMap { try? JSONDecoder().decode(PersistedState.self, from: $0) }
+        func decode(_ url: URL) -> PersistedState? {
+            (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(PersistedState.self, from: $0) }
+        }
+        // Fall back to the backup mirror if the primary is missing or corrupt,
+        // so lifetime totals survive a bad state.json instead of resetting.
+        let saved = decode(storeURL) ?? decode(backupURL)
         intervalMinutes = saved?.intervalMinutes ?? 60
         exercises = saved?.exercises
             ?? [Exercise(name: "Pushups", targetReps: 15), Exercise(name: "Situps", targetReps: 15)]
@@ -158,11 +181,12 @@ final class AppModel: ObservableObject {
     func fire() {
         guard case .running = phase else { return }
         endActivity()
-        guard !exercises.isEmpty else {
+        let group = currentGroup()
+        guard !group.isEmpty else {
             beginRunning(seconds: TimeInterval(intervalMinutes * 60))
             return
         }
-        dueItems = exercises.map { DueItem(id: $0.id, name: $0.name, targetReps: $0.targetReps) }
+        dueItems = group.map { DueItem(id: $0.id, name: $0.name, targetReps: $0.targetReps) }
         dueTotal = dueItems.count
         dueLogged = 0
         phase = .due
@@ -188,6 +212,7 @@ final class AppModel: ObservableObject {
             lifetimeRounds += 1
             flashCompletion()
         }
+        advanceBlock()   // every interval → next block (regardless of completion/skip)
         clearDeliveredNotifications()
         beginRunning(seconds: TimeInterval(intervalMinutes * 60))
     }
@@ -199,14 +224,55 @@ final class AppModel: ObservableObject {
         sessionRounds = 0
     }
 
+    /// Log reps done off-time (outside a scheduled round). Adds to session +
+    /// lifetime totals only — never touches the timer, due checklist, or rounds.
+    func logManual(name: String, reps: Int) {
+        let r = max(0, reps)
+        guard r > 0 else { return }
+        sessionReps[key(name), default: 0] += r
+        lifetimeReps[key(name), default: 0] += r
+    }
+
     // MARK: - Exercises
 
     func addExercise() {
-        exercises.append(Exercise(name: "Exercise", targetReps: 10))
+        exercises.append(Exercise(name: "Exercise", targetReps: 10, block: blockOrder.last ?? 0))
+    }
+
+    func addBlock() {
+        exercises.append(Exercise(name: "Exercise", targetReps: 10, block: (blockOrder.last ?? -1) + 1))
     }
 
     func removeExercise(_ id: UUID) {
         exercises.removeAll { $0.id == id }
+    }
+
+    // MARK: - Rotation
+    // Blocks cycle one per interval: each fire makes only the current block due,
+    // then resolve() advances to the next block.
+
+    /// Distinct block indices that actually have exercises, in cyclic order.
+    private var blockOrder: [Int] { Array(Set(exercises.map { $0.block })).sorted() }
+
+    /// Exercises firing next; normalizes currentBlock so it always lands on a real block.
+    private func currentGroup() -> [Exercise] {
+        let order = blockOrder
+        guard !order.isEmpty else { return [] }
+        if !order.contains(currentBlock) { currentBlock = order[0] }
+        return exercises.filter { $0.block == currentBlock }
+    }
+
+    private func advanceBlock() {
+        let order = blockOrder
+        guard let i = order.firstIndex(of: currentBlock) else { currentBlock = order.first ?? 0; return }
+        currentBlock = order[(i + 1) % order.count]
+    }
+
+    // View-facing (non-mutating — safe to read during SwiftUI body eval).
+    var blockCount: Int { blockOrder.count }
+    var currentBlockNumber: Int { (blockOrder.firstIndex(of: currentBlock) ?? 0) + 1 }
+    var currentBlockNames: String {
+        exercises.filter { $0.block == currentBlock }.map(\.name).joined(separator: ", ")
     }
 
     // MARK: - Internals
@@ -234,7 +300,12 @@ final class AppModel: ObservableObject {
                                    lifetimeReps: lifetimeReps, lifetimeRounds: lifetimeRounds)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? (try? encoder.encode(state))?.write(to: storeURL, options: .atomic)
+        guard let data = try? encoder.encode(state) else { return }
+        try? data.write(to: storeURL, options: .atomic)
+        // ponytail: mirror every save to a second file so a lost or corrupted
+        // state.json can't wipe lifetime totals. Same directory, so it won't
+        // survive disk loss — add an offsite/timestamped snapshot if that matters.
+        try? data.write(to: backupURL, options: .atomic)
     }
 
     // MARK: - Notifications
@@ -252,9 +323,10 @@ final class AppModel: ObservableObject {
         guard notificationsAvailable else { return }
         let content = UNMutableNotificationContent()
         content.title = "Time to move!"
-        content.body = exercises.isEmpty
+        let group = currentGroup()   // runs after advanceBlock, so this is what fires next
+        content.body = group.isEmpty
             ? "Time for a movement break."
-            : exercises.map { "\($0.name) × \($0.targetReps)" }.joined(separator: "  ·  ")
+            : group.map { "\($0.name) × \($0.targetReps)" }.joined(separator: "  ·  ")
         content.sound = .default
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, seconds), repeats: false)
         let center = UNUserNotificationCenter.current()

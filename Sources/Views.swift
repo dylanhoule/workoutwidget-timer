@@ -14,6 +14,8 @@ struct RootView: View {
                     DueSection(model: model)
                 } else {
                     TimerSection(model: model)
+                    Divider()
+                    QuickLogSection(model: model)
                 }
                 Divider()
                 StatsSection(model: model)
@@ -93,7 +95,10 @@ struct TimerSection: View {
         case .idle:
             return "every \(model.intervalMinutes) min"
         case .running(let end):
-            return "next round at \(end.formatted(date: .omitted, time: .shortened))"
+            let t = end.formatted(date: .omitted, time: .shortened)
+            return model.blockCount > 1
+                ? "block \(model.currentBlockNumber): \(model.currentBlockNames) · \(t)"
+                : "next round at \(t)"
         case .paused:
             return "paused"
         case .due:
@@ -183,6 +188,49 @@ struct DueRow: View {
     }
 }
 
+// MARK: - Off-time logging
+
+/// Log reps done outside a scheduled round. The Session/Lifetime numbers in
+/// StatsSection tick up on Log, so no separate confirmation is needed.
+struct QuickLogSection: View {
+    @ObservedObject var model: AppModel
+    @State private var selectedName = ""
+    @State private var reps = 10
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("LOG OFF-TIME")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+            HStack(spacing: 6) {
+                Picker("", selection: $selectedName) {
+                    ForEach(model.exercises) { ex in Text(ex.name).tag(ex.name) }
+                }
+                .labelsHidden()
+                TextField("", value: $reps, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 44)
+                Stepper("", value: $reps, in: 0...999).labelsHidden()
+                Button("Log") { model.logManual(name: selectedName, reps: reps) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(selectedName.isEmpty)
+            }
+        }
+        // ponytail: default to first exercise; if the selected name was renamed/
+        // removed, fall back so the picker never sits on a stale value.
+        .onAppear { fixSelection() }
+        .onChange(of: model.exercises) { _ in fixSelection() }
+    }
+
+    private func fixSelection() {
+        if !model.exercises.contains(where: { $0.name == selectedName }) {
+            selectedName = model.exercises.first?.name ?? ""
+        }
+    }
+}
+
 // MARK: - Stats
 
 struct StatsSection: View {
@@ -244,7 +292,10 @@ final class DuePanelController {
             p.titlebarAppearsTransparent = true
             p.isMovableByWindowBackground = true
             p.level = .floating                                   // above normal windows
-            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace]
+            // .canJoinAllSpaces and .moveToActiveSpace are mutually exclusive —
+            // setting both throws NSInternalInconsistencyException. Keep the
+            // "visible on every space" behavior; drop the conflicting flag.
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             p.hidesOnDeactivate = false
             p.isFloatingPanel = true
             [.closeButton, .miniaturizeButton, .zoomButton].forEach {
@@ -255,6 +306,14 @@ final class DuePanelController {
             panel = p
         }
         guard let panel else { return }
+        // ponytail: a titled NSPanel won't auto-size to its SwiftUI content, so
+        // size it to the hosting view's fittingSize on every show (keeps it correct
+        // if the exercise count changed). Without this the window stays ~zero-size
+        // and the panel appears empty / not at all.
+        if let host = panel.contentViewController {
+            host.view.layoutSubtreeIfNeeded()
+            panel.setContentSize(host.view.fittingSize)
+        }
         if let screen = NSScreen.main {                           // top-center of main screen
             let f = panel.frame, vf = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: vf.midX - f.width / 2,
@@ -307,6 +366,9 @@ struct SettingsSection: View {
                             .textFieldStyle(.roundedBorder)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 44)
+                        Stepper("B\(ex.block + 1)", value: $ex.block, in: 0...max(1, model.blockCount))
+                            .fixedSize()
+                            .help("Rotation block")
                         Button { model.removeExercise(ex.id) } label: {
                             Image(systemName: "minus.circle.fill")
                                 .foregroundColor(.secondary)
@@ -315,8 +377,13 @@ struct SettingsSection: View {
                         .help("Remove")
                     }
                 }
-                Button { model.addExercise() } label: {
-                    Label("Add exercise", systemImage: "plus")
+                HStack(spacing: 12) {
+                    Button { model.addExercise() } label: {
+                        Label("Add exercise", systemImage: "plus")
+                    }
+                    Button { model.addBlock() } label: {
+                        Label("Add block", systemImage: "square.stack.3d.up")
+                    }
                 }
                 .buttonStyle(.borderless)
             }

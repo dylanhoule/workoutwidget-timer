@@ -95,10 +95,67 @@ assert(reloaded.lifetimeReps["Pushups"] == 25 && reloaded.lifetimeReps["Situps"]
 assert(reloaded.lifetimeRounds == 1)
 assert(reloaded.sessionReps.isEmpty && reloaded.sessionRounds == 0)
 
-// Corrupt state file falls back to defaults
+// Off-time manual logging: adds to session + lifetime, no round, no phase change
+let dir3 = scratchDir()
+let m3 = AppModel(storageDirectory: dir3)
+m3.logManual(name: "Pushups", reps: 12)
+m3.logManual(name: "Pushups", reps: 3)   // accumulates
+m3.logManual(name: "Situps", reps: 0)    // zero is a no-op
+assert(m3.sessionReps["Pushups"] == 15 && m3.lifetimeReps["Pushups"] == 15)
+assert(m3.sessionReps["Situps"] == nil)  // logging 0 records nothing
+assert(m3.phase == .idle && m3.sessionRounds == 0 && m3.lifetimeRounds == 0)
+try? FileManager.default.removeItem(at: dir3)
+
+// Corrupt primary recovers from the backup mirror (lifetime survives)
 try! Data("not json".utf8).write(to: dir.appendingPathComponent("state.json"))
+let recovered = AppModel(storageDirectory: dir)
+assert(recovered.intervalMinutes == 45)                 // from backup, not defaults
+assert(recovered.lifetimeReps["Pushups"] == 25 && recovered.lifetimeReps["Situps"] == 15)
+
+// Corrupt BOTH primary and backup falls back to defaults
+try! Data("not json".utf8).write(to: dir.appendingPathComponent("state.json"))
+try! Data("not json".utf8).write(to: dir.appendingPathComponent("state.backup.json"))
 let fallback = AppModel(storageDirectory: dir)
 assert(fallback.intervalMinutes == 60 && fallback.exercises.count == 2)
+
+// Rotation: blocks fire one per interval, advancing each cycle then wrapping
+let dirR = scratchDir()
+let r = AppModel(storageDirectory: dirR)
+r.exercises = [
+    Exercise(name: "Pushups", targetReps: 15, block: 0),
+    Exercise(name: "Squats", targetReps: 20, block: 0),
+    Exercise(name: "Chinups", targetReps: 8, block: 1),
+    Exercise(name: "Crunches", targetReps: 30, block: 1),
+]
+assert(r.blockCount == 2)
+r.start()
+r.fire()
+assert(r.dueItems.map(\.name) == ["Pushups", "Squats"])   // block 1 fires first
+for id in r.dueItems.map(\.id) { r.log(id: id, reps: 10) }
+assert(r.sessionRounds == 1)
+r.fire()
+assert(r.dueItems.map(\.name) == ["Chinups", "Crunches"]) // rotated to block 2
+for id in r.dueItems.map(\.id) { r.log(id: id, reps: 5) }
+assert(r.sessionRounds == 2)
+r.fire()
+assert(r.dueItems.map(\.name) == ["Pushups", "Squats"])   // wrapped back to block 1
+assert(r.currentBlockNumber == 1)
+try? FileManager.default.removeItem(at: dirR)
+
+// Back-compat: old state.json without a `block` key loads intact (block → 0),
+// instead of failing to decode and wiping exercises + lifetime stats
+let dirL = scratchDir()
+let legacy = """
+{"exercises":[{"id":"\(UUID().uuidString)","name":"Pushups","targetReps":15}],\
+"intervalMinutes":45,"lifetimeReps":{"Pushups":100},"lifetimeRounds":5}
+"""
+try! Data(legacy.utf8).write(to: dirL.appendingPathComponent("state.json"))
+let legacyModel = AppModel(storageDirectory: dirL)
+assert(legacyModel.exercises.count == 1)
+assert(legacyModel.exercises[0].name == "Pushups" && legacyModel.exercises[0].block == 0)
+assert(legacyModel.intervalMinutes == 45 && legacyModel.lifetimeReps["Pushups"] == 100)
+assert(legacyModel.lifetimeRounds == 5)
+try? FileManager.default.removeItem(at: dirL)
 
 try? FileManager.default.removeItem(at: dir)
 print("ALL CHECKS PASSED")
