@@ -27,11 +27,13 @@ m.start()
 guard case .running(let end) = m.phase else { fatalError("expected running") }
 assert(abs(end.timeIntervalSinceNow - 3600) < 2)
 assert(m.iconSymbol == "timer")
+assert(m.runTotalSeconds == 3600)
 m.pause()
 guard case .paused(let remaining) = m.phase else { fatalError("expected paused") }
 assert(abs(remaining - 3600) < 2)
 m.resume()
 guard case .running = m.phase else { fatalError("expected running after resume") }
+assert(m.runTotalSeconds == 3600)  // resume keeps the denominator — ring must not refill
 m.reset()
 assert(m.phase == .idle && m.secondsLeft == 3600)
 

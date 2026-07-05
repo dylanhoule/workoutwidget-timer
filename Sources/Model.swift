@@ -51,13 +51,19 @@ final class AppModel: ObservableObject {
     @Published var phase: Phase = .idle
     @Published var dueItems: [DueItem] = []
     @Published var secondsLeft = 0
+    /// Total seconds of the current running stretch — denominator for the UI's
+    /// progress ring. Survives pause/resume so the ring doesn't refill on resume.
+    @Published var runTotalSeconds = 0
     @Published var justCompletedRound = false
 
     @Published var intervalMinutes: Int {
         didSet {
             let clamped = min(480, max(1, intervalMinutes))
             if intervalMinutes != clamped { intervalMinutes = clamped }
-            if case .idle = phase { secondsLeft = intervalMinutes * 60 }
+            if case .idle = phase {
+                secondsLeft = intervalMinutes * 60
+                runTotalSeconds = secondsLeft
+            }
             persist()
         }
     }
@@ -105,6 +111,7 @@ final class AppModel: ObservableObject {
         lifetimeReps = saved?.lifetimeReps ?? [:]
         lifetimeRounds = saved?.lifetimeRounds ?? 0
         secondsLeft = intervalMinutes * 60
+        runTotalSeconds = secondsLeft
 
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         // .common mode, or the countdown freezes while the popover tracks events
@@ -151,13 +158,14 @@ final class AppModel: ObservableObject {
 
     func resume() {
         guard case .paused(let remaining) = phase else { return }
-        beginRunning(seconds: remaining)
+        beginRunning(seconds: remaining, preserveTotal: true)
     }
 
     func reset() {
         phase = .idle
         dueItems = []
         secondsLeft = intervalMinutes * 60
+        runTotalSeconds = secondsLeft
         cancelPendingNotification()
         clearDeliveredNotifications()
         endActivity()
@@ -277,7 +285,8 @@ final class AppModel: ObservableObject {
 
     // MARK: - Internals
 
-    private func beginRunning(seconds: TimeInterval) {
+    private func beginRunning(seconds: TimeInterval, preserveTotal: Bool = false) {
+        if !preserveTotal { runTotalSeconds = Int(seconds.rounded(.up)) }
         phase = .running(end: Date().addingTimeInterval(seconds))
         secondsLeft = Int(seconds.rounded(.up))
         scheduleNotification(after: seconds)
